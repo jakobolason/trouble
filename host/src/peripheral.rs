@@ -412,12 +412,18 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
             .await?;
             info!("Set ext adv params ok");
 
+            /*
+             * Reports issue of `BleHost(Hci(Command Disallowed))`, from the spec:
+             *  """If the Host issues this command when periodic advertising is enabled for
+             *  the specified advertising set, the Controller shall return the error code:
+             *  Command Disallowed (0x0C)."""
+             */
             if let Err(e) = host
                 .command(LeSetPeriodicAdvParams::new(
                     handle,
                     interval.into(),
                     interval.into(),
-                    PeriodicAdvProps::new(),
+                    PeriodicAdvProps::default(),
                 ))
                 .await
             {
@@ -428,6 +434,8 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
 
             /*
              * Reports issue of `BleHost(Hci(Invalid HCI Command Parameters))`
+             * NOTE: Did so because I previously called peri.advertise_ext before this,
+             * and also because this was called after `LeSetPeriodicAdvEnable`
              */
             if !data.adv_data.is_empty() {
                 if let Err(e) = host
