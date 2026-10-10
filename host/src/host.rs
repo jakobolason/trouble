@@ -1238,6 +1238,12 @@ pub trait EventHandler {
     /// Handle an incoming HCI ISO data packet
     #[cfg(feature = "iso")]
     fn on_iso_data(&self, _packet: &IsoPacket<'_>) {}
+    /// Handle a single periodic advertising report
+    #[cfg(feature = "scan")]
+    fn on_periodic_adv_report(&self, report: &LePeriodicAdvertisingReport) {}
+
+    #[cfg(feature = "scan")]
+    fn on_sync(&self, report: &LePeriodicAdvertisingSyncEstablished) {}
 }
 
 struct DummyHandler;
@@ -1473,6 +1479,24 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                     {
                                         let data = unwrap!(LeAdvertisingReport::from_hci_bytes_complete(event.data));
                                         event_handler.on_adv_reports(data.reports.iter());
+                                    }
+                                }
+                                LeEventKind::LePeriodicAdvertisingSyncEstablished => {
+                                    #[cfg(feature = "scan")]
+                                    {
+                                        let data =
+                                            unwrap!(LeExtendedAdvertisingReport::from_hci_bytes_complete(event.data));
+                                        event_handler.on_sync(data);
+                                    }
+                                }
+                                LeEventKind::LePeriodicAdvertisingReport => {
+                                    #[cfg(feature = "scan")]
+                                    {
+                                        let data =
+                                            unwrap!(LeExtendedAdvertisingReport::from_hci_bytes_complete(event.data));
+                                        event_handler.on_periodic_adv_report(data);
+                                        //The data is a *single* report as specified here
+                                        //https://docs.rs/bt-hci/latest/bt_hci/event/le/struct.LePeriodicAdvertisingReport.html
                                     }
                                 }
                                 LeEventKind::LeLongTermKeyRequest => {
@@ -1743,7 +1767,30 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                 .enable_hardware_error(true)
                 .enable_disconnection_complete(true)
                 .enable_encryption_change_v1(true)
-                .enable_encryption_key_refresh_complete(true),
+                .enable_encryption_key_refresh_complete(true)
+                //Added:
+                .enable_role_change(true)
+                .enable_mode_change(true)
+                .enable_read_clock_offset_complete(true)
+                .enable_conn_packet_kind_changed(true)
+                .enable_page_scan_repetition_mode_change(true)
+                .enable_synchronous_conn_complete(true)
+                .enable_synchronous_conn_changed(true),
+        )
+        .exec(host.controller)
+        .await?;
+
+        //Added enable_synchronization_train_complete and enable_synchronization_train_received -- did nothing
+        SetEventMaskPage2::new(
+            EventMaskPage2::new()
+                .enable_encryption_change_v2(true)
+                //ADDED:
+                .enable_synchronization_train_received(true)
+                .enable_synchronization_train_complete(true)
+                .enable_connectionless_peripheral_broadcast_receive(true)
+                .enable_connectionless_peripheral_broadcast_timeout(true)
+                .enable_triggered_clock_capture(true)
+                .enable_connectionless_peripheral_broadcast_channel_map_change(true),
         )
         .exec(host.controller)
         .await?;
@@ -1766,6 +1813,18 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             .enable_le_adv_report(true)
             .enable_le_scan_timeout(true)
             .enable_le_ext_adv_report(true)
+            .enable_le_periodic_adv_sync_established_v1(true) //added
+            .enable_le_periodic_adv_report_v1(true) //added
+            .enable_le_periodic_adv_sync_lost(true) //added
+            .enable_le_channel_selection_algorithm(true) //added --I think this is key for PA
+            .enable_le_periodic_adv_subevent_data_request(true) //maybe comment out
+            .enable_le_periodic_adv_response_report(true) //New added
+            .enable_le_data_length_change(true)
+            .enable_le_big_sync_established(true)
+            .enable_le_big_sync_lost(true)
+            .enable_le_biginfo_adv_report(true)
+            //.enable_le_periodic_adv_sync_established_v2(true)// --also attempted. EA is v1 so this should be v1 as well
+            //.enable_le_periodic_adv_report_v2(true) //--also attempted
             .enable_le_long_term_key_request(true)
             .enable_le_phy_update_complete(true)
             .enable_le_data_length_change(true);
@@ -1856,17 +1915,15 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             .connections
             .set_link_credits(ret.total_num_le_acl_data_packets as usize);
 
-        {
-            const ACL_LEN: u16 = 255;
-            const ACL_N: u16 = 1;
-            info!(
-                "[host] configuring host buffers ({} packets of size {})",
-                ACL_N, ACL_LEN,
-            );
-            if let Err(_e) = HostBufferSize::new(ACL_LEN, 0, ACL_N, 0).exec(host.controller).await {
-                warn!("[host] error configuring host buffers (continuing)");
-            }
-        }
+        //const ACL_LEN: u16 = 251; //was originally 255,
+        const ACL_N: u16 = 1;
+        info!(
+            "[host] configuring host buffers ({} packets of size {})",
+            ACL_N, ret.le_acl_data_packet_length as u16,
+        );
+        HostBufferSize::new(ret.le_acl_data_packet_length as u16, 0, ACL_N, 0)
+            .exec(host.controller)
+            .await?;
 
         /*
                 #[cfg(feature = "controller-host-flow-control")]

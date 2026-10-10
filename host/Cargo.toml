@@ -39,6 +39,9 @@ zerocopy = "0.8.21"
 log = { version = "0.4.16", optional = true }
 defmt = { version = "1.0.1", optional = true }
 
+#[patch.crates-io]
+#bt-hci = {git= "https://github.com/Tomer-Eliahu/bt-hci.git", rev = "8b25775c13319fe0aa96f9fbe2de52dff195f6cd"}
+
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
   "time",
