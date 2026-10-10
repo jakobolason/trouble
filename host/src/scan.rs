@@ -2,15 +2,23 @@
 use core::future::Future;
 
 use bt_hci::cmd::le::{
-    LeAddDeviceToFilterAcceptList, LeClearFilterAcceptList, LeSetExtScanEnable, LeSetExtScanParams, LeSetScanEnable,
-    LeSetScanParams, LePeriodicAdvCreateSync, LePeriodicAdvCreateSyncParams, LeClearPeriodicAdvList, LeAddDeviceToPeriodicAdvList,
+    LeAddDeviceToFilterAcceptList,
+    LeAddDeviceToPeriodicAdvList,
+    LeClearFilterAcceptList,
+    LeClearPeriodicAdvList,
+    LePeriodicAdvCreateSync,
+    LePeriodicAdvCreateSyncParams,
+    LeSetExtScanEnable,
+    LeSetExtScanParams,
     //NEW ADDED
     // LE Set Periodic Advertising Receive Enable command [📖](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-b055b724-7607-bf63-3862-3e164dfc2251)
     //and param
-    LeSetPeriodicAdvReceiveEnable,LeSetPeriodicAdvReceiveEnableParams
-
+    LeSetPeriodicAdvReceiveEnable,
+    LeSetPeriodicAdvReceiveEnableParams,
+    LeSetScanEnable,
+    LeSetScanParams,
 };
-use bt_hci::controller::{Controller, ControllerCmdSync, ControllerCmdAsync};
+use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync};
 use bt_hci::param::{AddrKind, FilterDuplicates, ScanningPhy};
 pub use bt_hci::param::{LeAdvReportsIter, LeExtAdvReportsIter};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -36,16 +44,20 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
         Self { central }
     }
 
-    /// Retrieve the underlying central
-    pub fn into_inner(self) -> Central<'d, C, P> {
-        self.central
-    }
+    /// /// Retrieve the underlying central
+    /// pub fn into_inner(self) -> Central<'d, C, P> {
+    ///     self.central
+    /// }
 
     /// Enable extended scanning and synchronize with a periodic advertising train from an advertiser.
-    /// 
+    ///
     /// Details on the underlying command can be found here:
     /// https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-29188ef0-bf80-7807-2c96-385e7d9782ed
-    pub async fn scan_periodic(&mut self, config: &ScanConfig<'_>, param: LePeriodicAdvCreateSyncParams) -> Result<ScanSession<'_, true>, BleHostError<C::Error>>
+    pub async fn scan_periodic(
+        &mut self,
+        config: &ScanConfig<'_>,
+        param: LePeriodicAdvCreateSyncParams,
+    ) -> Result<ScanSession<'_, true>, BleHostError<C::Error>>
     where
         C: ControllerCmdAsync<LePeriodicAdvCreateSync> //Note the Async variation here
             + ControllerCmdSync<LeClearPeriodicAdvList>
@@ -57,32 +69,40 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
             + ControllerCmdSync<LeAddDeviceToFilterAcceptList>,
     {
         //First we enable extended scanning.
-        let host = &self.central.stack.host;
+        let host = self.central.host;
         let drop = crate::host::OnDrop::new(|| {
-            host.scan_command_state.cancel(true); //I think this should be true
+            host.scan_command_state().cancel(true); //I think this should be true
         });
-        
-        host.scan_command_state.request().await;
+
+        host.request_operation(host.scan_command_state(), true).await;
+        // NOTE: Maybe this causes an error
         //self.central.set_accept_filter(config.filter_accept_list).await?; --maybe this causes an error
 
         let scanning = ScanningPhy {
-            active_scan: config.active, 
-            scan_interval: config.interval.into(),
-            scan_window: config.window.into(),
+            active_scan: config.active,
+            scan_interval: bt_hci_duration(config.interval),
+            scan_window: bt_hci_duration(config.window),
         };
-        
+
         let phy_params = crate::central::create_phy_params(scanning, config.phys);
-        let host = &self.central.stack.host;
-        
+        let host = &self.central.host;
+
         //maybe comment this out to fall back on Vendor default
         host.command(LeSetExtScanParams::new(
-            host.address.map(|s| s.kind).unwrap_or(AddrKind::PUBLIC),
-            bt_hci::param::ScanningFilterPolicy::BasicUnfiltered, 
+            host.own_addr_kind(),
+            if config.filter_accept_list.is_empty() {
+                bt_hci::param::ScanningFilterPolicy::BasicUnfiltered
+            } else {
+                bt_hci::param::ScanningFilterPolicy::BasicFiltered
+            },
             phy_params,
         ))
         .await?;
 
         //This is the difference from simply scan_ext --it is fine to put this before ext scan enable
+        // NOTE: This might outlive extended scanning, and might need to be properly canceled or
+        // more expicitly be given a lifetime, such that the user knows to shut this down, before
+        // opening a new one (as doing so would give an HCI invalid or faulty command smth smth.).
         host.async_command(LePeriodicAdvCreateSync::new(
             param.options,
             param.adv_sid,
@@ -90,23 +110,21 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
             param.adv_addr,
             param.skip,
             param.sync_timeout,
-            param.sync_cte_kind
+            param.sync_cte_kind,
         ))
         .await?;
-
 
         //config.window is the duration of the scan.
         //config.interval is the period of the scan.
         //We can scan continuously by settting these to 0 seconds.
         host.command(LeSetExtScanEnable::new(
             true,
-            FilterDuplicates::Disabled,
-            config.window.into(),
-            config.interval.into(),
+            config.filter_duplicates,
+            bt_hci_duration(config.timeout),
+            bt_hci::param::Duration::from_secs(0),
         ))
         .await?;
 
-        
         //This is the difference from simply scan_ext
         // host.async_command(LePeriodicAdvCreateSync::new(
         //     param.options,
@@ -120,19 +138,26 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
         // .await?;
 
         // embassy_time::Timer::after_secs(5).await;
-        // //This is indeed a sync command-- HACK: we know the SyncHandle will be 0
-        // host.command(LeSetPeriodicAdvReceiveEnable::new(bt_hci::param::SyncHandle::default(), 
-        // bt_hci::param::LePeriodicAdvReceiveEnable::new().set_duplicate_filtering(false).set_reporting(true))).await?;
+        // //This is indeed a sync command--
+        // HACK: we know the SyncHandle will be 0
+        host.command(LeSetPeriodicAdvReceiveEnable::new(
+            bt_hci::param::SyncHandle::default(),
+            bt_hci::param::LePeriodicAdvReceiveEnable::new()
+                .set_duplicate_filtering(false)
+                .set_reporting(true),
+        ))
+        .await?;
 
         drop.defuse();
         Ok(ScanSession {
-            command_state: &self.central.stack.host.scan_command_state,
+            command_state: &self.central.host.scan_command_state(),
             deadline: if config.timeout.as_ticks() == 0 {
                 None
             } else {
-                Some(Instant::now() + config.timeout.into())
+                Some(Instant::now() + config.timeout)
             },
             done: false,
+            timeout: host.scan_timeout(),
         })
     }
 
@@ -196,10 +221,9 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
     /// Disabling scanning when it is already disabled has no effect.
     pub async fn stop_ext_scan(&mut self) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<LeSetExtScanEnable>
+        C: ControllerCmdSync<LeSetExtScanEnable>,
     {
-
-        let host = &self.central.stack.host;
+        let host = &self.central.host;
 
         //The Enable parameter determines whether scanning is enabled or disabled.
         //If it is set to 0x00, the remaining parameters shall be ignored.
@@ -216,21 +240,21 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
     }
 
     ///Stop scanning. Needed as currently the timeout for ScanSession does nothing.
-    /// 
+    ///
     /// **Note**: Has no impact on extended scanning.
     /// Disabling scanning when it is already disabled has no effect.
-    /// 
+    ///
     /// For more info:
     /// https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-10327f75-4024-80df-14bc-68fe1e42b9e0:~:text=7.8.11.%20LE%20Set%20Scan%20Enable%20command
     pub async fn stop_scan(&mut self) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<LeSetScanEnable>
+        C: ControllerCmdSync<LeSetScanEnable>,
     {
-        let host = &self.central.stack.host;
+        let host = &self.central.host;
         let drop = crate::host::OnDrop::new(|| {
-            host.scan_command_state.cancel(false);
+            host.scan_command_state().cancel(false);
         });
-        host.scan_command_state.request().await;
+        host.scan_command_state().request(true).await; // FIXME: Is `true` correct?
         host.command(LeSetScanEnable::new(false, false)).await?;
         drop.defuse();
         Ok(())

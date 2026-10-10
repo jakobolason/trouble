@@ -32,12 +32,12 @@ use bt_hci::controller::{blocking, Controller, ControllerCmdAsync, ControllerCmd
 #[cfg(feature = "iso")]
 use bt_hci::data::IsoPacket;
 use bt_hci::data::{AclBroadcastFlag, AclPacket, AclPacketBoundary};
-#[cfg(feature = "scan")]
-use bt_hci::event::le::LeAdvertisingReport;
-#[cfg(feature = "scan")]
-use bt_hci::event::le::LeExtendedAdvertisingReport;
 #[cfg(feature = "subrating")]
 use bt_hci::event::le::LeSubrateChange;
+#[cfg(feature = "scan")]
+use bt_hci::event::le::{
+    LeAdvertisingReport, LeExtendedAdvertisingReport, LePeriodicAdvertisingReport, LePeriodicAdvertisingSyncEstablished,
+};
 use bt_hci::event::le::{
     LeAdvertisingSetTerminated, LeConnectionComplete, LeConnectionRateChange, LeConnectionUpdateComplete,
     LeDataLengthChange, LeEnhancedConnectionComplete, LeEventKind, LeEventPacket, LeFrameSpaceUpdateComplete,
@@ -1484,17 +1484,18 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                 LeEventKind::LePeriodicAdvertisingSyncEstablished => {
                                     #[cfg(feature = "scan")]
                                     {
-                                        let data =
-                                            unwrap!(LeExtendedAdvertisingReport::from_hci_bytes_complete(event.data));
-                                        event_handler.on_sync(data);
+                                        let data = unwrap!(
+                                            LePeriodicAdvertisingSyncEstablished::from_hci_bytes_complete(event.data)
+                                        );
+                                        event_handler.on_sync(&data);
                                     }
                                 }
                                 LeEventKind::LePeriodicAdvertisingReport => {
                                     #[cfg(feature = "scan")]
                                     {
                                         let data =
-                                            unwrap!(LeExtendedAdvertisingReport::from_hci_bytes_complete(event.data));
-                                        event_handler.on_periodic_adv_report(data);
+                                            unwrap!(LePeriodicAdvertisingReport::from_hci_bytes_complete(event.data));
+                                        event_handler.on_periodic_adv_report(&data);
                                         //The data is a *single* report as specified here
                                         //https://docs.rs/bt-hci/latest/bt_hci/event/le/struct.LePeriodicAdvertisingReport.html
                                     }
