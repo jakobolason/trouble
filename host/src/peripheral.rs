@@ -14,6 +14,7 @@ use bt_hci::controller::{Controller, ControllerCmdSync};
 #[cfg(feature = "extended-advertising")]
 use bt_hci::param::Operation;
 use bt_hci::param::{AddrKind, AdvChannelMap, AdvHandle, AdvKind, AdvSet, BdAddr, LeConnRole};
+use bt_hci::WriteHci;
 use embassy_futures::select::{select, Either};
 
 #[cfg(feature = "extended-advertising")]
@@ -438,6 +439,13 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
              * and also because this was called after `LeSetPeriodicAdvEnable`
              */
             if !data.adv_data.is_empty() {
+                let cmd = LeSetPeriodicAdvData::new(handle, Operation::Complete, data.adv_data);
+                let mut buf = [0u8; 64];
+                let n = cmd.size();
+                if let Err(e) = cmd.write_hci(&mut buf[..]) {
+                    error!("encode failed: ");
+                }
+                info!("per adv data cmd params ({} bytes): {=[u8]:x}", n, &buf[..n]);
                 if let Err(e) = host
                     .command(LeSetPeriodicAdvData::new(handle, Operation::Complete, data.adv_data))
                     .await
@@ -455,7 +463,7 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
 
             handles[i].adv_handle = handle;
             handles[i].duration = bt_hci_duration(set.params.timeout.unwrap_or(embassy_time::Duration::from_micros(0)));
-            handles[i].max_ext_adv_events = set.params.max_events.unwrap_or(0);
+            handles[i].max_ext_adv_events = set.params.max_events.unwrap_or(1);
         }
         trace!("[host] enabling extended advertising");
 

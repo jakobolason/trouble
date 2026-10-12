@@ -1487,6 +1487,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         let data = unwrap!(
                                             LePeriodicAdvertisingSyncEstablished::from_hci_bytes_complete(event.data)
                                         );
+                                        info!("Sync established!");
                                         event_handler.on_sync(&data);
                                     }
                                 }
@@ -1495,6 +1496,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                     {
                                         let data =
                                             unwrap!(LePeriodicAdvertisingReport::from_hci_bytes_complete(event.data));
+                                        info!("Periodic advertising report data found!");
                                         event_handler.on_periodic_adv_report(&data);
                                         //The data is a *single* report as specified here
                                         //https://docs.rs/bt-hci/latest/bt_hci/event/le/struct.LePeriodicAdvertisingReport.html

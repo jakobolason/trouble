@@ -140,13 +140,13 @@ impl<'d, 'stack, C: Controller, P: PacketPool> Scanner<'d, 'stack, C, P> {
         // embassy_time::Timer::after_secs(5).await;
         // //This is indeed a sync command--
         // HACK: we know the SyncHandle will be 0
-        host.command(LeSetPeriodicAdvReceiveEnable::new(
-            bt_hci::param::SyncHandle::default(),
-            bt_hci::param::LePeriodicAdvReceiveEnable::new()
-                .set_duplicate_filtering(false)
-                .set_reporting(true),
-        ))
-        .await?;
+        // host.command(LeSetPeriodicAdvReceiveEnable::new(
+        //     bt_hci::param::SyncHandle::default(),
+        //     bt_hci::param::LePeriodicAdvReceiveEnable::new()
+        //         .set_duplicate_filtering(false)
+        //         .set_reporting(true),
+        // ))
+        // .await?;
 
         drop.defuse();
         Ok(ScanSession {
