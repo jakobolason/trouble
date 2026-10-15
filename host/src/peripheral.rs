@@ -355,6 +355,10 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         }
     }
 
+    /// Begin periodic advertisement
+    ///
+    /// Starts sending `ADV_EXT_IND` without data, then sends periodic `AUX_ADV_IND` as per the
+    /// provided configuration (TODO)
     pub async fn per_adv_ext<'k>(
         &mut self,
         //FIXME: Only support 1 set
@@ -486,6 +490,7 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         })
     }
 
+    /// Update the periodic advertisement data
     pub async fn update_per_adv_ext(&mut self, handle: AdvHandle, data: &[u8]) -> Result<(), BleHostError<C::Error>>
     where
         C: for<'t> ControllerCmdSync<LeSetPeriodicAdvData<'t>>,
