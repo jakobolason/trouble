@@ -14,7 +14,6 @@ use bt_hci::controller::{Controller, ControllerCmdSync};
 #[cfg(feature = "extended-advertising")]
 use bt_hci::param::Operation;
 use bt_hci::param::{AddrKind, AdvChannelMap, AdvHandle, AdvKind, AdvSet, BdAddr, LeConnRole};
-use bt_hci::WriteHci;
 use embassy_futures::select::{select, Either};
 
 #[cfg(feature = "extended-advertising")]
@@ -361,16 +360,18 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
     /// provided configuration (TODO)
     pub async fn per_adv_ext<'k>(
         &mut self,
-        //FIXME: Only support 1 set
-        sets: &[AdvertisementSet<'k>],
+        set: &AdvertisementSet<'k>,
         //TODO: Figure out what to do with this
-        handles: &mut [AdvSet],
+        adv_set: &mut AdvSet,
         interval: core::time::Duration,
     ) -> Result<Advertiser<'d, C, P>, BleHostError<C::Error>>
     where
         C: ControllerCmdSync<LeSetPeriodicAdvParams>
             + ControllerCmdSync<LeSetExtAdvParams>
+            + ControllerCmdSync<LeSetAdvSetRandomAddr>
+            + ControllerCmdSync<LeSetExtAdvData<'k>>
             + for<'t> ControllerCmdSync<LeSetPeriodicAdvData<'t>>
+            + for<'t> ControllerCmdSync<LeSetExtAdvEnable<'t>>
             + ControllerCmdSync<LeSetPeriodicAdvEnable>,
     {
         let host = &self.host;
@@ -381,106 +382,122 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         });
         host.request_operation(host.advertise_command_state(), true).await;
 
-        // Clear current advertising terminations
+        // - 1: Clear current advertising terminations
         host.advertise_state().reset();
 
-        for (i, set) in sets.iter().enumerate() {
-            let set = &sets[i];
-            let handle = AdvHandle::new(i as u8);
-            let data: RawAdvertisement<'k> = set.data.into();
-            let params = set.params;
-            let peer = data.peer.unwrap_or_default();
-            let own_addr_kind = params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind());
-            let random_addr = if let Some(addr) = set.address {
-                Some(addr)
-            } else {
-                host.address().as_ref().map(|a| a.addr)
-            };
+        let handle = AdvHandle::new(0_u8);
+        let data: RawAdvertisement<'k> = set.data.into();
+        let params = set.params;
+        let peer = data.peer.unwrap_or_default();
+        let own_addr_kind = params.own_addr_kind.unwrap_or_else(|| host.own_addr_kind());
+        let random_addr = if let Some(addr) = set.address {
+            Some(addr)
+        } else {
+            host.address().as_ref().map(|a| a.addr)
+        };
 
-            host.command(LeSetExtAdvParams::new(
+        // - 2: Set Ext Advertising params
+        host.command(LeSetExtAdvParams::new(
+            handle,
+            data.props,
+            bt_hci_ext_duration(params.interval_min),
+            bt_hci_ext_duration(params.interval_max),
+            params.channel_map.unwrap_or(AdvChannelMap::ALL),
+            own_addr_kind,
+            peer.kind,
+            peer.addr,
+            params.filter_policy,
+            params.tx_power as i8,
+            params.primary_phy,
+            0,
+            params.secondary_phy,
+            0,
+            false,
+        ))
+        .await?;
+        info!("Set ext adv params ok");
+
+        // NOTE:
+        // - 3: Set Adv set random addr
+        if let Some(addr) = random_addr {
+            host.command(LeSetAdvSetRandomAddr::new(handle, addr)).await?;
+            info!("Set adv set random addr ok");
+        }
+
+        // NOTE:
+        // - 4: Set Ext Adv Data
+        if !data.adv_data.is_empty() {
+            host.command(LeSetExtAdvData::new(
                 handle,
-                data.props,
-                bt_hci_ext_duration(params.interval_min),
-                bt_hci_ext_duration(params.interval_max),
-                params.channel_map.unwrap_or(AdvChannelMap::ALL),
-                own_addr_kind,
-                peer.kind,
-                peer.addr,
-                params.filter_policy,
-                params.tx_power as i8,
-                params.primary_phy,
-                0,
-                params.secondary_phy,
-                0,
-                false,
+                Operation::Complete,
+                params.fragment,
+                data.adv_data,
             ))
             .await?;
-            info!("Set ext adv params ok");
+        }
 
-            /*
-             * Reports issue of `BleHost(Hci(Command Disallowed))`, from the spec:
-             *  """If the Host issues this command when periodic advertising is enabled for
-             *  the specified advertising set, the Controller shall return the error code:
-             *  Command Disallowed (0x0C)."""
-             */
+        /*
+         * Reports issue of `BleHost(Hci(Command Disallowed))`, from the spec:
+         *  """If the Host issues this command when periodic advertising is enabled for
+         *  the specified advertising set, the Controller shall return the error code:
+         *  Command Disallowed (0x0C)."""
+         */
+        // - 5: Set Periodic Adv params
+        if let Err(e) = host
+            .command(LeSetPeriodicAdvParams::new(
+                handle,
+                interval.into(),
+                interval.into(),
+                PeriodicAdvProps::default(),
+            ))
+            .await
+        {
+            error!("periodic params failed:  ");
+            return Err(e);
+        }
+        info!("periodic params ok");
+
+        /*
+         * Reports issue of `BleHost(Hci(Invalid HCI Command Parameters))`
+         * NOTE: Did so because I previously called peri.advertise_ext before this,
+         * and also because this was called after `LeSetPeriodicAdvEnable`
+         */
+        // - 6: Set Periodic Adv data
+        if !data.adv_data.is_empty() {
             if let Err(e) = host
-                .command(LeSetPeriodicAdvParams::new(
-                    handle,
-                    interval.into(),
-                    interval.into(),
-                    PeriodicAdvProps::default(),
-                ))
+                .command(LeSetPeriodicAdvData::new(handle, Operation::Complete, data.adv_data))
                 .await
             {
-                error!("periodic params failed:  ");
+                error!("periodic data failed: ");
                 return Err(e);
             }
-            info!("periodic params ok");
-
-            /*
-             * Reports issue of `BleHost(Hci(Invalid HCI Command Parameters))`
-             * NOTE: Did so because I previously called peri.advertise_ext before this,
-             * and also because this was called after `LeSetPeriodicAdvEnable`
-             */
-            if !data.adv_data.is_empty() {
-                let cmd = LeSetPeriodicAdvData::new(handle, Operation::Complete, data.adv_data);
-                let mut buf = [0u8; 64];
-                let n = cmd.size();
-                if let Err(e) = cmd.write_hci(&mut buf[..]) {
-                    error!("encode failed: ");
-                }
-                info!("per adv data cmd params ({} bytes): {=[u8]:x}", n, &buf[..n]);
-                if let Err(e) = host
-                    .command(LeSetPeriodicAdvData::new(handle, Operation::Complete, data.adv_data))
-                    .await
-                {
-                    error!("periodic data failed: ");
-                    return Err(e);
-                }
-                info!("Inserted found data");
-            }
+            info!("Inserted found data");
             info!("periodic data ok");
 
             /*
              * TODO: Is scan data allowed here?
              * */
 
-            handles[i].adv_handle = handle;
-            handles[i].duration = bt_hci_duration(set.params.timeout.unwrap_or(embassy_time::Duration::from_micros(0)));
-            handles[i].max_ext_adv_events = set.params.max_events.unwrap_or(1);
+            adv_set.adv_handle = handle;
+            adv_set.duration = bt_hci_duration(set.params.timeout.unwrap_or(embassy_time::Duration::from_micros(0)));
+            adv_set.max_ext_adv_events = set.params.max_events.unwrap_or(0);
         }
         trace!("[host] enabling extended advertising");
 
-        host.advertise_state().start(handles);
-        // FIXME: quick fix that it only uses the first adv_handle
+        host.advertise_state().start(&[*adv_set]);
+        // - 7: Enable Per Adv
         if let Err(e) = host
-            .command(LeSetPeriodicAdvEnable::new(true, handles[0].adv_handle))
+            .command(LeSetPeriodicAdvEnable::new(true, adv_set.adv_handle))
             .await
         {
             error!("periodic enable failed: ");
             return Err(e);
         }
         info!("periodic enable ok");
+
+        // NOTE:
+        // - 8: Enable Ext Adv
+        host.command(LeSetExtAdvEnable::new(true, &[*adv_set])).await?;
 
         drop.defuse();
         Ok(Advertiser {

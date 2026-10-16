@@ -14,12 +14,12 @@ use bt_hci::cmd::le::{
     // LE Set Periodic Advertising Receive Enable command [📖](https://www.bluetooth.com/wp-content/uploads/Files/Specification/HTML/Core-54/out/en/host-controller-interface/host-controller-interface-functional-specification.html#UUID-b055b724-7607-bf63-3862-3e164dfc2251)
     //and param
     LeSetPeriodicAdvReceiveEnable,
-    LeSetPeriodicAdvReceiveEnableParams,
+    // LeSetPeriodicAdvReceiveEnableParams,
     LeSetScanEnable,
     LeSetScanParams,
 };
 use bt_hci::controller::{Controller, ControllerCmdAsync, ControllerCmdSync};
-use bt_hci::param::{AddrKind, FilterDuplicates, ScanningPhy};
+use bt_hci::param::{FilterDuplicates, ScanningPhy};
 pub use bt_hci::param::{LeAdvReportsIter, LeExtAdvReportsIter};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::signal::Signal;

@@ -1242,6 +1242,7 @@ pub trait EventHandler {
     #[cfg(feature = "scan")]
     fn on_periodic_adv_report(&self, report: &LePeriodicAdvertisingReport) {}
 
+    /// Handle a sync operation from periodic advertisement scanning
     #[cfg(feature = "scan")]
     fn on_sync(&self, report: &LePeriodicAdvertisingSyncEstablished) {}
 }
