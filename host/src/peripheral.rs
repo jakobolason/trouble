@@ -500,6 +500,8 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
         host.command(LeSetExtAdvEnable::new(true, &[*adv_set])).await?;
 
         drop.defuse();
+
+        info!("periodic created");
         Ok(Advertiser {
             host: self.host,
             extended: true,
@@ -512,12 +514,9 @@ impl<'d, C: Controller, P: PacketPool> Peripheral<'d, C, P> {
     where
         C: for<'t> ControllerCmdSync<LeSetPeriodicAdvData<'t>>,
     {
-        /*
-        * Same problem as above
-           self.host
-           .command(LeSetPeriodicAdvData::new(handle, Operation::Complete, data))
-           .await?;
-        */
+        self.host
+            .command(LeSetPeriodicAdvData::new(handle, Operation::Complete, data))
+            .await?;
         Ok(())
     }
 }
