@@ -22,7 +22,7 @@ features = ["defmt", "peripheral", "central", "gatt", "scan", "derive", "securit
 targets = ["thumbv7em-none-eabi"]
 
 [dependencies]
-bt-hci = { version = "0.10", features = ["uuid"] }
+bt-hci = { version = "0.11", features = ["uuid"] }
 embassy-crypto = { git = "https://github.com/embassy-rs/embassy.git", rev = "bd35bd7a7d19147c8bcae9c2eda99b25e597294c", optional = true }
 embedded-io = { version = "0.7" }
 embassy-sync = "0.8"
@@ -38,6 +38,9 @@ zerocopy = "0.8.21"
 # Logging
 log = { version = "0.4.16", optional = true }
 defmt = { version = "1.0.1", optional = true }
+
+#[patch.crates-io]
+#bt-hci = {git= "https://github.com/Tomer-Eliahu/bt-hci.git", rev = "8b25775c13319fe0aa96f9fbe2de52dff195f6cd"}
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
