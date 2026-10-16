@@ -490,9 +490,34 @@ where
             && self.state.advertise_command_state.is_idle()
             && self.state.scan_command_state.is_idle())
         {
+            // `poll_cancelled` took this update when all states were idle, but a procedure can
+            // become active before we get the gate (for example, a new `advertise()` that held
+            // the gate while it waited for the cancel of the previous advertising). Keep the
+            // update for a later sync: `push` merges it with a newer update into a full sync.
+            self.state.resolving_list_state.borrow_mut().push(update);
             return Ok(());
         }
 
+        self.sync_resolving_list_unchecked(update).await
+    }
+
+    /// Sync the controller's resolving list, without the check that no procedure is active.
+    ///
+    /// The runner uses it for the start-up full sync. An early `advertise()` (or scan, or connect)
+    /// makes its command state active before it waits for the host to be initialized, so the check
+    /// in `sync_resolving_list` would skip that sync. The caller must make sure that no advertising,
+    /// scanning or connect command can reach the controller during the sync (Bluetooth Core
+    /// Vol 4, Part E, §7.8.38, §7.8.40, §7.8.44, §7.8.77).
+    #[cfg(feature = "security")]
+    async fn sync_resolving_list_unchecked(&self, update: ResolvingListUpdate) -> Result<(), BleHostError<T::Error>>
+    where
+        T: ControllerCmdSync<LeClearResolvingList>
+            + ControllerCmdSync<LeSetAddrResolutionEnable>
+            + ControllerCmdSync<LeRemoveDeviceFromResolvingList>
+            + ControllerCmdSync<LeAddDeviceToResolvingList>
+            + ControllerCmdSync<LeSetPrivacyMode>,
+        T::Error: crate::fmt::Format,
+    {
         let local_irk = self.state.connections.security_manager.get_local_irk();
         let local_irk_bytes = local_irk.map(|k| k.to_le_bytes()).unwrap_or_default();
 
@@ -711,7 +736,7 @@ where
         true
     }
 
-    fn handle_acl(&self, acl: AclPacket<'_>, event_handler: &dyn EventHandler) -> Result<(), Error> {
+    pub(crate) fn handle_acl(&self, acl: AclPacket<'_>, event_handler: &dyn EventHandler) -> Result<(), Error> {
         self.state.connections.received(acl.handle())?;
         let handle = acl.handle();
         let (header, pdu) = match acl.boundary_flag() {
@@ -761,7 +786,7 @@ where
                             .reassembly(acl.handle(), |p| {
                                 let r = if !p.in_progress() {
                                     // Init the new assembly assuming the length of the SDU.
-                                    let (first, payload) = data.split_at(2);
+                                    let (first, payload) = data.split_at_checked(2).ok_or(Error::InvalidValue)?;
                                     let len: u16 = u16::from_le_bytes([first[0], first[1]]);
                                     self.state.channels.check_sdu_len(header.channel, len)?;
                                     let Some(packet) = P::allocate() else {
@@ -820,7 +845,7 @@ where
                             .connections
                             .reassembly(acl.handle(), |p| {
                                 if !p.in_progress() {
-                                    let (first, payload) = data.split_at(2);
+                                    let (first, payload) = data.split_at_checked(2).ok_or(Error::InvalidValue)?;
                                     let len: u16 = u16::from_le_bytes([first[0], first[1]]);
                                     self.state.channels.check_sdu_len(header.channel, len)?;
                                     let Some(packet) = P::allocate() else {
@@ -955,13 +980,16 @@ where
                         }
                         Err(e) => {
                             warn!("Error decoding attribute payload: {:?}", e);
-                            let opcode = pdu.as_ref()[0];
-                            // Bit 6 = Command Flag. Only send error responses for requests (flag=0)
-                            if opcode & 0x40 == 0 {
+                            // An empty PDU has no opcode: ignore it.
+                            let Some(&opcode) = pdu.as_ref().first() else {
+                                return Ok(());
+                            };
+                            // Answer only requests; see `decode_error_code`.
+                            if let Some(code) = att::decode_error_code(opcode) {
                                 let rsp = att::Att::Server(AttServer::Response(att::AttRsp::Error {
                                     request: opcode,
                                     handle: 0,
-                                    code: att::AttErrorCode::REQUEST_NOT_SUPPORTED,
+                                    code,
                                 }));
                                 let l2cap = L2capHeader {
                                     channel: L2CAP_CID_ATT,
@@ -1267,7 +1295,7 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
     /// Run the host.
     pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<Disconnect>
+        C: ControllerCmdAsync<Disconnect>
             + ControllerCmdSync<SetEventMask>
             + ControllerCmdSync<SetEventMaskPage2>
             + ControllerCmdSync<LeSetEventMask>
@@ -1298,7 +1326,7 @@ impl<'d, C: Controller, P: PacketPool> Runner<'d, C, P> {
     /// Run the host with a vendor event handler for custom events.
     pub async fn run_with_handler<E: EventHandler>(&mut self, event_handler: &E) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<Disconnect>
+        C: ControllerCmdAsync<Disconnect>
             + ControllerCmdSync<SetEventMask>
             + ControllerCmdSync<SetEventMaskPage2>
             + ControllerCmdSync<LeSetEventMask>
@@ -1347,7 +1375,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
     /// Run the receive loop that polls the controller for events.
     pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<Disconnect>,
+        C: ControllerCmdAsync<Disconnect>,
     {
         let dummy = DummyHandler;
         self.run_with_handler(&dummy).await
@@ -1357,7 +1385,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
     /// vendor events to the provided closure.
     pub async fn run_with_handler<E: EventHandler>(&mut self, event_handler: &E) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<Disconnect>,
+        C: ControllerCmdAsync<Disconnect>,
     {
         let host = &self.host;
         // use embassy_time::Instant;
@@ -1422,7 +1450,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         ResolvablePrivateAddrs::none(),
                                     ) {
                                         let _ = host
-                                            .command(Disconnect::new(
+                                            .async_command(Disconnect::new(
                                                 e.handle,
                                                 DisconnectReason::RemoteDeviceTerminatedConnLowResources,
                                             ))
@@ -1451,7 +1479,7 @@ impl<'d, C: Controller, P: PacketPool> RxRunner<'d, C, P> {
                                         },
                                     ) {
                                         let _ = host
-                                            .command(Disconnect::new(
+                                            .async_command(Disconnect::new(
                                                 e.handle,
                                                 DisconnectReason::RemoteDeviceTerminatedConnLowResources,
                                             ))
@@ -1718,7 +1746,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
     /// Run the control loop for the host
     pub async fn run(&mut self) -> Result<(), BleHostError<C::Error>>
     where
-        C: ControllerCmdSync<Disconnect>
+        C: ControllerCmdAsync<Disconnect>
             + ControllerCmdSync<SetEventMask>
             + ControllerCmdSync<SetEventMaskPage2>
             + ControllerCmdSync<LeSetEventMask>
@@ -1851,8 +1879,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         // create or accept a CIS.
         #[cfg(feature = "iso")]
         {
-            const LE_FEATURE_CIS_HOST: u8 = 32;
-            if let Err(e) = LeSetHostFeature::new(LE_FEATURE_CIS_HOST, 1)
+            if let Err(e) = LeSetHostFeature::new(bt_hci::param::LeHostFeature::CONN_ISO_STREAM, true)
                 .exec(host.controller)
                 .await
             {
@@ -1869,8 +1896,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         // start the Connection Subrate Update procedure on us.
         #[cfg(feature = "subrating")]
         {
-            const LE_FEATURE_CONN_SUBRATING_HOST: u8 = 38;
-            if let Err(e) = LeSetHostFeature::new(LE_FEATURE_CONN_SUBRATING_HOST, 1)
+            if let Err(e) = LeSetHostFeature::new(bt_hci::param::LeHostFeature::CONN_SUBRATING, true)
                 .exec(host.controller)
                 .await
             {
@@ -1887,8 +1913,7 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         // start the Connection Rate Change procedure on us.
         #[cfg(feature = "shorter-connection-intervals")]
         {
-            const LE_FEATURE_SHORTER_CONNECTION_INTERVALS_HOST: u16 = 73;
-            if let Err(e) = LeSetHostFeatureV2::new(LE_FEATURE_SHORTER_CONNECTION_INTERVALS_HOST, 1)
+            if let Err(e) = LeSetHostFeatureV2::new(bt_hci::param::LeHostFeatureV2::SHORTER_CONNECTION_INTERVALS, true)
                 .exec(host.controller)
                 .await
             {
@@ -1939,13 +1964,16 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                 }
         */
 
-        let _ = host.state.initialized.init(InitialState {
+        // Mark the host as initialized only after the privacy setup below. The start-up resolving
+        // list sync does not check that advertising, scanning and connecting are idle. This is safe
+        // only because the commands of these procedures wait for this mark, so none of them can
+        // reach the controller during the sync.
+        let initial_state = InitialState {
             acl_max: ret.le_acl_data_packet_length as usize,
             acl_total: ret.total_num_le_acl_data_packets as usize,
-        });
-        info!("[host] initialized");
+        };
 
-        let device_address = host.command(ReadBdAddr::new()).await?;
+        let device_address = ReadBdAddr::new().exec(host.controller).await?;
         if *device_address.raw() != [0, 0, 0, 0, 0, 0] {
             let device_address = Address::new(AddrKind::PUBLIC, device_address);
             info!("[host] Device Address {}", device_address);
@@ -1972,9 +2000,13 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
         #[cfg(feature = "security")]
         if host.is_privacy_enabled() {
             host.state.resolving_list_state.borrow_mut().clear();
-            host.sync_resolving_list(ResolvingListUpdate::FullSync).await?;
+            host.sync_resolving_list_unchecked(ResolvingListUpdate::FullSync)
+                .await?;
             info!("[host] privacy initialized");
         }
+
+        let _ = host.state.initialized.init(initial_state);
+        info!("[host] initialized");
 
         loop {
             match select5(
@@ -2002,7 +2034,10 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
             {
                 Either5::First(request) => {
                     trace!("[host] poll disconnecting links");
-                    let force = match host.command(Disconnect::new(request.handle(), request.reason())).await {
+                    let force = match host
+                        .async_command(Disconnect::new(request.handle(), request.reason()))
+                        .await
+                    {
                         Ok(_) => false,
                         Err(BleHostError::BleHost(Error::Hci(bt_hci::param::Error::UNKNOWN_CONN_IDENTIFIER))) => {
                             warn!(
@@ -2049,18 +2084,30 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                     CancelledCommandState::Advertise(ext) => {
                         trace!("[host] disabling advertising");
                         #[cfg(feature = "extended-advertising")]
-                        if ext {
-                            host.command(LeSetExtAdvEnable::new(false, &[])).await?
+                        let result = if ext {
+                            host.command(LeSetExtAdvEnable::new(false, &[])).await.map(drop)
                         } else {
-                            host.command(LeSetAdvEnable::new(false)).await?
-                        }
+                            host.command(LeSetAdvEnable::new(false)).await.map(drop)
+                        };
                         #[cfg(not(feature = "extended-advertising"))]
-                        {
+                        let result = {
                             // Extended advertising cannot have been started
                             // (`advertise_ext` is compiled out), so `ext` is
                             // always false here.
                             let _ = ext;
-                            host.command(LeSetAdvEnable::new(false)).await?
+                            host.command(LeSetAdvEnable::new(false)).await.map(drop)
+                        };
+                        match result {
+                            // Disabling legacy advertising that is already disabled has no effect
+                            // (Bluetooth Core v6.2, Vol 4, Part E, §7.8.9), but a controller may
+                            // still report "Command Disallowed" for it. That is benign, and must
+                            // not stop the runner: the disable also runs after every accepted
+                            // legacy advertising connection. For extended advertising, a rejected
+                            // disable can leave sets active, so the error is not tolerated there.
+                            Err(BleHostError::BleHost(Error::Hci(bt_hci::param::Error::CMD_DISALLOWED))) if !ext => {}
+                            // Any other failure is a real error: stop the runner with the original
+                            // error, like before the command state went through the cancel path.
+                            other => other?,
                         }
                         host.state.advertise_command_state.canceled();
                     }
@@ -2320,6 +2367,44 @@ mod tests {
             ConnectionEvent::ConnectionParamsUpdateFailed {
                 status: Status::UNACCEPTABLE_CONN_PARAMETERS
             }
+        ));
+    }
+
+    /// A sync that finds an active procedure keeps its update for a later sync.
+    #[cfg(feature = "security")]
+    #[test]
+    fn deferred_resolving_list_sync_keeps_the_update() {
+        use embassy_futures::block_on;
+
+        use crate::mock_controller::MockController;
+        use crate::prelude::DefaultPacketPool;
+        use crate::{Address, HostResources, Identity};
+
+        let mut resources: HostResources<DefaultPacketPool, 2, 2> = HostResources::new();
+        let builder = crate::new(MockController::new(), &mut resources);
+        let ble = BleHost::new(
+            builder.controller.as_ref().unwrap(),
+            builder.host_state.as_ref().unwrap(),
+        );
+        let identity = Identity {
+            addr: Address::random([1, 2, 3, 4, 5, 0xC6]),
+            irk: None,
+        };
+
+        // Advertising became active after `poll_cancelled` took the update.
+        block_on(ble.advertise_command_state().request(false));
+        // The mock controller panics on any command, so this also checks that the sync sends none.
+        block_on(ble.sync_resolving_list(ResolvingListUpdate::Add(identity))).unwrap();
+        assert!(matches!(
+            ble.state.resolving_list_state.borrow().state,
+            Some(ResolvingListUpdate::Add(i)) if i == identity
+        ));
+
+        // A second deferred update makes a full sync, so no update is lost.
+        block_on(ble.sync_resolving_list(ResolvingListUpdate::Remove(identity))).unwrap();
+        assert!(matches!(
+            ble.state.resolving_list_state.borrow().state,
+            Some(ResolvingListUpdate::FullSync)
         ));
     }
 }

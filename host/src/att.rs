@@ -158,7 +158,8 @@ impl codec::Encode for AttErrorCode {
 
 impl codec::Decode<'_> for AttErrorCode {
     fn decode(src: &[u8]) -> Result<Self, codec::Error> {
-        Ok(Self { value: src[0] })
+        let value = *src.first().ok_or(codec::Error::InvalidValue)?;
+        Ok(Self { value })
     }
 }
 
@@ -423,9 +424,16 @@ impl<'d> ReadByTypeIter<'d> {
         if self.cursor.available() >= self.item_len {
             let res = (|| {
                 let handle: u16 = self.cursor.read()?;
-                let item = self.cursor.slice(self.item_len - 2)?;
+                // The item length includes the 2-byte handle.
+                let item_len = self.item_len.checked_sub(2).ok_or(crate::Error::InvalidValue)?;
+                let item = self.cursor.slice(item_len)?;
                 Ok((handle, item))
             })();
+            if res.is_err() {
+                // A malformed item (for example an item length below 2) must not yield
+                // errors forever: mark the iterator as exhausted.
+                self.item_len = usize::MAX;
+            }
             Some(res)
         } else {
             None
@@ -797,6 +805,24 @@ impl<'d> AttReq<'d> {
 
     fn decode_with_opcode(opcode: u8, r: ReadCursor<'d>) -> Result<Self, codec::Error> {
         let payload = r.remaining();
+        // Refuse a request that is shorter than its fixed fields. Requests that have
+        // only fixed fields must have the exact length.
+        let (min_len, exact) = match opcode {
+            ATT_READ_BY_GROUP_TYPE_REQ | ATT_READ_BY_TYPE_REQ | ATT_FIND_BY_TYPE_VALUE_REQ => (6, false),
+            ATT_PREPARE_WRITE_REQ => (4, false),
+            ATT_FIND_INFORMATION_REQ | ATT_READ_BLOB_REQ => (4, true),
+            ATT_WRITE_REQ => (2, false),
+            ATT_READ_REQ | ATT_EXCHANGE_MTU_REQ => (2, true),
+            ATT_EXECUTE_WRITE_REQ => (1, true),
+            _ => (0, false),
+        };
+        if payload.len() < min_len || (exact && payload.len() != min_len) {
+            return Err(codec::Error::InvalidValue);
+        }
+        // ATT_READ_MULTIPLE_VARIABLE_REQ needs a set of two or more handles.
+        if opcode == ATT_READ_MULTIPLE_REQ && (payload.len() < 4 || payload.len() & 1 != 0) {
+            return Err(codec::Error::InvalidValue);
+        }
         match opcode {
             ATT_READ_BY_GROUP_TYPE_REQ => {
                 let start_handle = (payload[0] as u16) + ((payload[1] as u16) << 8);
@@ -805,7 +831,7 @@ impl<'d> AttReq<'d> {
                 let group_type = if payload.len() == 6 {
                     Uuid::Uuid16([payload[4], payload[5]])
                 } else if payload.len() == 20 {
-                    let uuid = payload[4..21].try_into().map_err(|_| codec::Error::InvalidValue)?;
+                    let uuid = payload[4..20].try_into().map_err(|_| codec::Error::InvalidValue)?;
                     Uuid::Uuid128(uuid)
                 } else {
                     return Err(codec::Error::InvalidValue);
@@ -900,6 +926,36 @@ impl<'d> AttReq<'d> {
     }
 }
 
+/// Returns the error code for an ATT PDU that failed to decode, or `None` if the server must not answer.
+///
+/// The server answers only requests: not commands (bit 6 of the opcode), not responses, notifications and
+/// indications (odd opcodes), and not the confirmation. A known request that is not valid gets
+/// `Invalid PDU`; an unknown request gets `Request Not Supported`.
+pub(crate) fn decode_error_code(opcode: u8) -> Option<AttErrorCode> {
+    if opcode & 0x40 != 0 || opcode & 1 != 0 || opcode == ATT_HANDLE_VALUE_CFM {
+        return None;
+    }
+    let known = matches!(
+        opcode,
+        ATT_READ_BY_GROUP_TYPE_REQ
+            | ATT_READ_BY_TYPE_REQ
+            | ATT_READ_REQ
+            | ATT_WRITE_REQ
+            | ATT_EXCHANGE_MTU_REQ
+            | ATT_FIND_BY_TYPE_VALUE_REQ
+            | ATT_FIND_INFORMATION_REQ
+            | ATT_PREPARE_WRITE_REQ
+            | ATT_EXECUTE_WRITE_REQ
+            | ATT_READ_MULTIPLE_REQ
+            | ATT_READ_BLOB_REQ
+    );
+    Some(if known {
+        AttErrorCode::INVALID_PDU
+    } else {
+        AttErrorCode::REQUEST_NOT_SUPPORTED
+    })
+}
+
 impl<'d> AttCmd<'d> {
     fn size(&self) -> usize {
         1 + match self {
@@ -921,6 +977,9 @@ impl<'d> AttCmd<'d> {
 
     fn decode_with_opcode(opcode: u8, r: ReadCursor<'d>) -> Result<Self, codec::Error> {
         let payload = r.remaining();
+        if opcode == ATT_WRITE_CMD && payload.len() < 2 {
+            return Err(codec::Error::InvalidValue);
+        }
         match opcode {
             ATT_WRITE_CMD => {
                 let handle = (payload[0] as u16) + ((payload[1] as u16) << 8);
@@ -1015,5 +1074,186 @@ impl codec::Encode for Att<'_> {
 impl<'d> codec::Decode<'d> for Att<'d> {
     fn decode(data: &'d [u8]) -> Result<Self, codec::Error> {
         Self::decode(data)
+    }
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+
+    /// Every request and command opcode, with every payload length from 0 to 21 bytes:
+    /// the decoder must return, not panic.
+    #[test]
+    fn short_requests_do_not_panic() {
+        let opcodes = [
+            ATT_READ_BY_GROUP_TYPE_REQ,
+            ATT_READ_BY_TYPE_REQ,
+            ATT_READ_REQ,
+            ATT_WRITE_REQ,
+            ATT_EXCHANGE_MTU_REQ,
+            ATT_FIND_BY_TYPE_VALUE_REQ,
+            ATT_FIND_INFORMATION_REQ,
+            ATT_PREPARE_WRITE_REQ,
+            ATT_EXECUTE_WRITE_REQ,
+            ATT_READ_BLOB_REQ,
+            ATT_READ_MULTIPLE_REQ,
+            ATT_WRITE_CMD,
+        ];
+        for opcode in opcodes {
+            for len in 0..=21 {
+                let mut packet = [0u8; 22];
+                packet[0] = opcode;
+                let _ = Att::decode(&packet[..1 + len]);
+            }
+        }
+        assert!(Att::decode(&[]).is_err());
+    }
+
+    #[test]
+    fn short_requests_are_refused() {
+        assert!(Att::decode(&[ATT_READ_REQ]).is_err());
+        assert!(Att::decode(&[ATT_READ_REQ, 1]).is_err());
+        assert!(Att::decode(&[ATT_READ_REQ, 1, 0]).is_ok());
+        assert!(Att::decode(&[ATT_READ_REQ, 1, 0, 0]).is_err(), "too long");
+        assert!(Att::decode(&[ATT_WRITE_CMD, 1]).is_err());
+        assert!(Att::decode(&[ATT_WRITE_CMD, 1, 0]).is_ok());
+    }
+
+    /// An Error Response without all its fields is an error.
+    #[test]
+    fn short_error_response() {
+        let packet = [ATT_ERROR_RSP, ATT_READ_REQ, 1, 0, 0x0A];
+        for len in 0..4 {
+            assert!(Att::decode(&packet[..1 + len]).is_err(), "{len} bytes");
+        }
+        assert!(Att::decode(&packet).is_ok());
+    }
+
+    /// A Read By Type response with an item length below 2 is an error.
+    #[test]
+    fn read_by_type_response_with_short_items() {
+        for opcode in [ATT_READ_BY_TYPE_RSP, ATT_READ_BY_GROUP_TYPE_RSP] {
+            for item_len in [0u8, 1] {
+                let packet = [opcode, item_len, 1, 0, 2, 0];
+                match Att::decode(&packet) {
+                    Ok(Att::Server(AttServer::Response(AttRsp::ReadByType { mut it }))) => {
+                        assert!(matches!(it.next(), Some(Err(_))), "item length {item_len}");
+                    }
+                    Ok(Att::Server(AttServer::Response(AttRsp::ReadByGroupType { mut it }))) => {
+                        assert!(matches!(it.next(), Some(Err(_))), "item length {item_len}");
+                    }
+                    _ => panic!("unexpected decode result"),
+                }
+            }
+        }
+    }
+
+    /// An iterator over malformed items must terminate instead of yielding errors forever.
+    #[test]
+    fn read_by_type_iterator_terminates_on_malformed_items() {
+        for opcode in [ATT_READ_BY_TYPE_RSP, ATT_READ_BY_GROUP_TYPE_RSP] {
+            for item_len in [0u8, 1] {
+                let packet = [opcode, item_len, 1, 0, 2, 0];
+                match Att::decode(&packet) {
+                    Ok(Att::Server(AttServer::Response(AttRsp::ReadByType { mut it })))
+                    | Ok(Att::Server(AttServer::Response(AttRsp::ReadByGroupType { mut it }))) => {
+                        assert!(matches!(it.next(), Some(Err(_))));
+                        assert!(it.next().is_none(), "must terminate after an error");
+                        assert!(it.next().is_none(), "must keep returning None");
+                    }
+                    _ => panic!("unexpected decode result"),
+                }
+            }
+        }
+    }
+
+    /// The minimum length is accepted, one byte less is refused.
+    #[test]
+    fn minimum_lengths() {
+        let cases: [(u8, usize); 10] = [
+            (ATT_READ_BY_GROUP_TYPE_REQ, 6),
+            (ATT_READ_BY_TYPE_REQ, 6),
+            (ATT_FIND_BY_TYPE_VALUE_REQ, 6),
+            (ATT_FIND_INFORMATION_REQ, 4),
+            (ATT_PREPARE_WRITE_REQ, 4),
+            (ATT_READ_BLOB_REQ, 4),
+            (ATT_READ_REQ, 2),
+            (ATT_WRITE_REQ, 2),
+            (ATT_EXCHANGE_MTU_REQ, 2),
+            (ATT_EXECUTE_WRITE_REQ, 1),
+        ];
+        for (opcode, min) in cases {
+            let mut packet = [0u8; 22];
+            packet[0] = opcode;
+            packet[1] = 1;
+            assert!(
+                Att::decode(&packet[..1 + min]).is_ok(),
+                "opcode {opcode:#x}, {min} bytes"
+            );
+            assert!(
+                Att::decode(&packet[..min]).is_err(),
+                "opcode {opcode:#x}, {} bytes",
+                min - 1
+            );
+        }
+    }
+
+    #[test]
+    fn read_by_group_type_with_128_bit_uuid() {
+        let mut packet = [0u8; 21];
+        packet[0] = ATT_READ_BY_GROUP_TYPE_REQ;
+        packet[1..5].copy_from_slice(&[0x01, 0x00, 0xFF, 0xFF]);
+        for (i, byte) in packet[5..21].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        match Att::decode(&packet) {
+            Ok(Att::Client(AttClient::Request(AttReq::ReadByGroupType { start, end, group_type }))) => {
+                assert_eq!((start, end), (1, 0xFFFF));
+                let expected: [u8; 16] = core::array::from_fn(|i| i as u8);
+                assert_eq!(group_type.as_raw(), &expected[..]);
+            }
+            _ => panic!("unexpected decode result"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_request_that_is_not_valid() {
+        assert_eq!(decode_error_code(ATT_READ_REQ), Some(AttErrorCode::INVALID_PDU));
+        assert_eq!(
+            decode_error_code(ATT_READ_MULTIPLE_REQ),
+            Some(AttErrorCode::INVALID_PDU)
+        );
+        assert!(Att::decode(&[ATT_READ_MULTIPLE_REQ, 1, 0]).is_err());
+    }
+
+    #[test]
+    fn unknown_request() {
+        // 0x0E is ATT_READ_MULTIPLE_REQ, which the server does not support.
+        assert_eq!(decode_error_code(0x0E), Some(AttErrorCode::REQUEST_NOT_SUPPORTED));
+        assert_eq!(decode_error_code(0x30), Some(AttErrorCode::REQUEST_NOT_SUPPORTED));
+    }
+
+    #[test]
+    fn no_answer_when_the_pdu_is_not_a_request() {
+        assert_eq!(decode_error_code(ATT_WRITE_CMD), None, "a command");
+        assert_eq!(decode_error_code(0xD2), None, "a signed write command");
+        assert_eq!(decode_error_code(ATT_READ_RSP), None, "a response");
+        assert_eq!(decode_error_code(ATT_ERROR_RSP), None, "a response");
+        assert_eq!(decode_error_code(ATT_HANDLE_VALUE_NTF), None, "a notification");
+        assert_eq!(decode_error_code(ATT_HANDLE_VALUE_IND), None, "an indication");
+        assert_eq!(decode_error_code(ATT_HANDLE_VALUE_CFM), None, "a confirmation");
+    }
+
+    #[test]
+    fn read_multiple_variable_needs_two_handles() {
+        assert!(Att::decode(&[ATT_READ_MULTIPLE_REQ]).is_err());
+        assert!(Att::decode(&[ATT_READ_MULTIPLE_REQ, 1, 0]).is_err(), "1 handle");
+        assert!(Att::decode(&[ATT_READ_MULTIPLE_REQ, 1, 0, 2]).is_err(), "odd length");
+        assert!(Att::decode(&[ATT_READ_MULTIPLE_REQ, 1, 0, 2, 0]).is_ok());
     }
 }
